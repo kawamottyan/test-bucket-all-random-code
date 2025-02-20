@@ -8,9 +8,94 @@ import torch.optim as optim
 from tqdm import tqdm
 from src.recommendation.common.storage.s3_handler import S3Handler
 from src.models.networks import ActorNetwork, CriticNetwork
-from src.models.earlystopping import EarlyStopping
+import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+class EarlyStopping:
+    def __init__(
+        self, patience=7, min_delta=0.0001, verbose=True, path="checkpoint.pt"
+    ):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.verbose = verbose
+        self.path = path
+        self.counter = 0
+        self.best_value_loss = float("inf")
+        self.early_stop = False
+
+    def __call__(
+        self,
+        value_loss,
+        actor_model,
+        critic_model,
+        target_actor_model,
+        target_critic_model,
+    ):
+        if value_loss < self.best_value_loss - self.min_delta:
+            self.save_checkpoint(
+                value_loss,
+                actor_model,
+                critic_model,
+                target_actor_model,
+                target_critic_model,
+            )
+            self.best_value_loss = value_loss
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.verbose:
+                print(f"EarlyStopping counter: {self.counter} out of {self.patience}")
+            if self.counter >= self.patience:
+                self.early_stop = True
+
+    def save_checkpoint(
+        self,
+        value_loss,
+        actor_model,
+        critic_model,
+        target_actor_model,
+        target_critic_model,
+    ):
+        if self.verbose:
+            print(
+                f"Validation loss decreased ({self.best_value_loss:.6f} --> {value_loss:.6f}). Saving models..."
+            )
+        torch.save(
+            {
+                "actor_state_dict": actor_model.state_dict(),
+                "critic_state_dict": critic_model.state_dict(),
+                "target_actor_state_dict": target_actor_model.state_dict(),
+                "target_critic_state_dict": target_critic_model.state_dict(),
+                "value_loss": value_loss,
+            },
+            self.path,
+        )
+
+
+class ReplayBuffer:
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.buffer = []
+        self.position = 0
+
+    def push(self, state, action, reward, next_state, mask):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.position] = (state, action, reward, next_state, mask)
+        self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size: int):
+        batch = np.random.choice(self.buffer, batch_size, replace=False)
+        state, action, reward, next_state, mask = zip(*batch)
+        return (
+            torch.stack(state),
+            torch.stack(action),
+            torch.stack(reward),
+            torch.stack(next_state),
+            torch.stack(mask),
+        )
 
 
 class DDPGAgent:
@@ -75,6 +160,8 @@ class DDPGAgent:
             hidden_size2=config["critic_hidden_size2"],
             dropout_rate=config["critic_dropout_rate"],
         ).to(self.device)
+
+        self.replay_buffer = ReplayBuffer(capacity=100000)
 
     def _initialize_optimizers(self, config: Dict):
         self.actor_optimizer = optim.Adam(
@@ -142,81 +229,132 @@ class DDPGAgent:
             num_epochs,
         )
 
+        best_value_loss = float("inf")
         for epoch in range(1, num_epochs + 1):
-            # モデルを学習モードに設定
-            self.actor.train()
-            self.critic.train()
-            self.target_actor.train()
-            self.target_critic.train()
+            train_value_loss = 0.0
+            train_policy_loss = 0.0
+            batch_count = 0
 
             for batch in tqdm(self.train_loader):
+                # モデルを学習モードに設定
+                self.actor.train()
+                self.critic.train()
+                self.target_actor.train()
+                self.target_critic.train()
+
                 # バッチデータの取得と前処理
-                states = batch["state"].to(self.device)  # [batch_size, 50, 1182]
-                next_states = batch["next_state"].to(self.device)
-                actions = batch["action"].to(self.device)
-                rewards = batch["reward"].unsqueeze(1).to(self.device)
-                mask = batch["mask"].to(self.device)  # [batch_size, 50]
+                batch = {k: v.to(self.device) for k, v in batch.items()}
 
-                # サンプリング（同じ）
-                indices = torch.randperm(states.size(0))[: self.train_sample_size]
-                sampled_states = states[indices]
-                sampled_next_states = next_states[indices]
-                sampled_actions = actions[indices]
-                sampled_rewards = rewards[indices]
-                sampled_mask = mask[indices]
+                # ReplayBufferには元のCPUデータを保存
+                self.replay_buffer.push(
+                    batch["state"],
+                    batch["action"],
+                    batch["reward"],
+                    batch["next_state"],
+                    batch["mask"],
+                )
+                # Replay Bufferからサンプリング
+                if len(self.replay_buffer.buffer) >= self.train_sample_size:
+                    (
+                        sampled_states,
+                        sampled_actions,
+                        sampled_rewards,
+                        sampled_next_states,
+                        sampled_mask,
+                    ) = self.replay_buffer.sample(self.train_sample_size)
 
-                # Criticの更新
-                self.critic_optimizer.zero_grad()
-                with torch.no_grad():
-                    # マスクを使用してターゲットアクションを生成
-                    target_actions = self.target_actor(
-                        sampled_next_states, sampled_mask
-                    ).to(self.device)
+                    sampled_states = sampled_states.to(self.device)
+                    sampled_actions = sampled_actions.to(self.device)
+                    sampled_rewards = sampled_rewards.to(self.device)
+                    sampled_next_states = sampled_next_states.to(self.device)
+                    sampled_mask = sampled_mask.to(self.device)
 
-                    # マスクを使用してターゲットQ値を計算
-                    target_q_value = self.target_critic(
-                        sampled_next_states, target_actions, sampled_mask
-                    ).to(self.device)
+                    # Criticの更新
+                    self.critic_optimizer.zero_grad()
+                    with torch.no_grad():
+                        # マスクを使用してターゲットアクションを生成
+                        target_actions = self.target_actor(
+                            sampled_next_states, sampled_mask
+                        )
 
-                    target = sampled_rewards + self.gamma * target_q_value
+                        # マスクを使用してターゲットQ値を計算
+                        target_q_value = self.target_critic(
+                            sampled_next_states, target_actions, sampled_mask
+                        )
 
-                # 現在のQ値の計算（マスク使用）
-                q_value = self.critic(sampled_states, sampled_actions, sampled_mask).to(
-                    self.device
+                        target = sampled_rewards + self.gamma * target_q_value
+
+                    # 現在のQ値の計算（マスク使用）
+                    q_value = self.critic(sampled_states, sampled_actions, sampled_mask)
+
+                    critic_loss = nn.MSELoss()(q_value, target)
+                    critic_loss.backward()
+                    self.critic_optimizer.step()
+
+                    # Actorの更新
+                    self.actor_optimizer.zero_grad()
+                    # マスクを使用してアクションを予測
+                    predicted_action = self.actor(sampled_states, sampled_mask)
+
+                    noise = (
+                        torch.randn_like(predicted_action).to(self.device)
+                        * self.action_noise
+                    )
+                    predicted_action = predicted_action + noise
+
+                    # マスクを使用してポリシー損失を計算
+                    policy_loss = -self.critic(
+                        sampled_states, predicted_action, sampled_mask
+                    ).mean()
+
+                    policy_loss.backward()
+                    self.actor_optimizer.step()
+
+                    self._soft_target_update()
+
+                    train_value_loss += critic_loss.item()
+                    train_policy_loss += policy_loss.item()
+                    batch_count += 1
+
+            # エポックごとの平均損失を計算
+            if batch_count > 0:
+                avg_train_value_loss = train_value_loss / batch_count
+                avg_train_policy_loss = train_policy_loss / batch_count
+
+                # 評価
+                test_value_loss, test_policy_loss = self.evaluate()
+
+                # Early stopping判定
+                if self.early_stopping_flag:
+                    self.early_stopping(
+                        test_value_loss,
+                        self.actor,
+                        self.critic,
+                        self.target_actor,
+                        self.target_critic,
+                    )
+
+                    if self.early_stopping.early_stop:
+                        print("Early stopping triggered")
+                        # 最良のモデルを読み込む
+                        best_value_loss = self.early_stopping.load_checkpoint(
+                            self.actor,
+                            self.critic,
+                            self.target_actor,
+                            self.target_critic,
+                        )
+                        break
+
+                # ログ出力
+                logger.info(
+                    f"Epoch {epoch}/{num_epochs} - "
+                    f"Train Value Loss: {avg_train_value_loss:.6f}, "
+                    f"Train Policy Loss: {avg_train_policy_loss:.6f}, "
+                    f"Test Value Loss: {test_value_loss:.6f}, "
+                    f"Test Policy Loss: {test_policy_loss:.6f}"
                 )
 
-                critic_loss = nn.MSELoss()(q_value, target)
-                critic_loss.backward()
-                self.critic_optimizer.step()
-
-                # Actorの更新
-                self.actor_optimizer.zero_grad()
-                # マスクを使用してアクションを予測
-                predicted_action = self.actor(sampled_states, sampled_mask).to(
-                    self.device
-                )
-
-                noise = (
-                    torch.randn_like(predicted_action).to(self.device)
-                    * self.action_noise
-                )
-                predicted_action = predicted_action + noise
-
-                # マスクを使用してポリシー損失を計算
-                policy_loss = (
-                    -self.critic(sampled_states, predicted_action, sampled_mask)
-                    .mean()
-                    .to(self.device)
-                )
-
-                policy_loss.backward()
-                self.actor_optimizer.step()
-
-                self._soft_target_update()
-
-            self.evaluate()
-            if self.early_stopping_flag and self.early_stopping.early_stop:
-                break
+        return best_value_loss
 
     def evaluate(self):
         self.actor.eval()
@@ -226,6 +364,7 @@ class DDPGAgent:
 
         test_value_loss = 0.0
         test_policy_loss = 0.0
+        batch_count = 0
 
         with torch.no_grad():
             for batch in tqdm(self.eval_loader, desc="Evaluating Batches"):
@@ -234,29 +373,31 @@ class DDPGAgent:
                 actions = batch["action"].to(self.device)
                 rewards = batch["reward"].unsqueeze(1).to(self.device)
                 dones = batch["done"].unsqueeze(1).to(self.device)
+                mask = batch["mask"].to(self.device)
 
-                target_actions = self.target_actor(next_states).to(self.device)
-                target_q_value = self.target_critic(next_states, target_actions).to(
-                    self.device
-                )
+                target_actions = self.target_actor(next_states, mask).to(self.device)
+                target_q_value = self.target_critic(
+                    next_states, target_actions, mask
+                ).to(self.device)
                 target = (rewards + (1.0 - dones) * self.gamma * target_q_value).to(
                     self.device
                 )
 
-                q_value = self.critic(states, actions).to(self.device)
-                test_value_loss += nn.MSELoss()(q_value, target).item()
+                q_value = self.critic(states, actions, mask).to(self.device)
+                value_loss = nn.MSELoss()(q_value, target)
+                test_value_loss += value_loss.item()
 
-                predicted_action = self.actor(states).to(self.device)
+                predicted_action = self.actor(states, mask).to(self.device)
                 policy_loss = (
-                    -self.critic(states, predicted_action).mean().to(self.device)
+                    -self.critic(states, predicted_action, mask).mean().to(self.device)
                 )
                 test_policy_loss += policy_loss.item()
+                batch_count += 1
 
-        test_value_loss /= len(self.eval_loader)
-        test_policy_loss /= len(self.eval_loader)
+        test_value_loss /= batch_count
+        test_policy_loss /= batch_count
 
-        if self.early_stopping_flag:
-            self.early_stopping(test_value_loss, test_policy_loss)
+        return test_value_loss, test_policy_loss
 
     def save_model(
         self,

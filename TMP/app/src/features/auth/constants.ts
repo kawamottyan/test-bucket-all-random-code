@@ -1,0 +1,9 @@
+export const MIN_PASSWORD_LENGTH = 8;
+export const MAX_PASSWORD_LENGTH = 20;
+export const MAX_NAME_LENGTH = 12;
+export const OTP_TOKEN_LENGTH = 6;
+export const MINUTES = 60 * 1000;
+export const EXPIRATION_TIMEOUT = 30 * MINUTES;
+export const PASSWORD_RESET_TOKEN_LENGTH = 10;
+export const MAX_ATTEMPTS = 5;
+export const LOCKOUT_DURATION = 15 * MINUTES;

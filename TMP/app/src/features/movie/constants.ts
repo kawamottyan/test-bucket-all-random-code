@@ -1,0 +1,9 @@
+export const POSTER_BASE_URL = "https://image.tmdb.org/t/p/w500";
+export const YOUTUBE_BASE_URL = "https://www.youtube.com/embed/";
+export const REMAINING_SLIDES_THRESHOLD = 5;
+export const WHEEL_SENSITIVITY = 50;
+export const MIN_MOVIE_COUNT = 5;
+export const ITEMS_PER_PAGE = 10;
+export const VISIBILITY_THRESHOLD = 0.5;
+export const REDIS_TRENDING_PREFIX = "trending_movies";
+export const REDIS_RECOMMENDATION_PREFIX = "recommendation";
